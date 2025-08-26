@@ -6,11 +6,14 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
+	"github.com/kris-nova/logger"
 
 	"github.com/weaveworks/eksctl/pkg/awsapi"
 
@@ -141,7 +144,8 @@ func (m *OpenIDConnectManager) DeleteProvider(ctx context.Context) error {
 }
 
 // getIssuerCAThumbprint obtains thumbprint of root CA by connecting to the
-// OIDC issuer and parsing certificates
+// OIDC issuer and parsing certificates. It implements a fallback mechanism
+// to use the alternative EKS API endpoint when the primary OIDC endpoint fails.
 func (m *OpenIDConnectManager) getIssuerCAThumbprint() error {
 	client := &http.Client{
 		Transport: &http.Transport{
@@ -153,11 +157,78 @@ func (m *OpenIDConnectManager) getIssuerCAThumbprint() error {
 		},
 	}
 
+	// First attempt: try the original OIDC endpoint
 	response, err := client.Get(m.issuerURL.String())
 	if err != nil {
+		// Check if this is a DNS resolution error that might benefit from fallback
+		if isDNSError(err) {
+			// Try the alternative endpoint
+			alternativeURL, altErr := m.constructAlternativeURL()
+			if altErr == nil {
+				logger.Warning("Failed to connect to OIDC endpoint %s, trying alternative endpoint %s", m.issuerURL.String(), alternativeURL)
+				response, err = client.Get(alternativeURL)
+				if err == nil {
+					// Success with alternative endpoint
+					defer response.Body.Close()
+					return m.extractThumbprintFromResponse(response)
+				}
+			}
+		}
 		return fmt.Errorf("connecting to issuer OIDC: %w", err)
 	}
 	defer response.Body.Close()
+	return m.extractThumbprintFromResponse(response)
+}
+
+// isDNSError checks if the error is related to DNS resolution
+func isDNSError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for DNS-related errors
+	if dnsErr, ok := err.(*net.DNSError); ok {
+		return dnsErr.IsNotFound
+	}
+
+	// Check for common DNS error messages
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "no such host") ||
+		strings.Contains(errStr, "nxdomain") ||
+		strings.Contains(errStr, "name resolution")
+}
+
+// constructAlternativeURL creates the alternative EKS API endpoint URL
+func (m *OpenIDConnectManager) constructAlternativeURL() (string, error) {
+	originalHost := m.issuerURL.Hostname()
+
+	// Extract region from the original OIDC URL
+	// Expected format: oidc.eks.<region>.amazonaws.com
+	if !strings.HasPrefix(originalHost, "oidc.eks.") || !strings.HasSuffix(originalHost, ".amazonaws.com") {
+		return "", fmt.Errorf("unexpected OIDC URL format: %s", originalHost)
+	}
+
+	// Extract the region part
+	regionPart := strings.TrimPrefix(originalHost, "oidc.eks.")
+	region := strings.TrimSuffix(regionPart, ".amazonaws.com")
+
+	if region == "" {
+		return "", fmt.Errorf("could not extract region from OIDC URL: %s", originalHost)
+	}
+
+	// Construct the alternative URL: eks.<region>.api.aws
+	alternativeHost := fmt.Sprintf("eks.%s.api.aws", region)
+	alternativeURL := &url.URL{
+		Scheme: m.issuerURL.Scheme,
+		Host:   alternativeHost + ":443",
+		Path:   m.issuerURL.Path,
+	}
+
+	return alternativeURL.String(), nil
+}
+
+// extractThumbprintFromResponse extracts the certificate thumbprint from the HTTP response
+func (m *OpenIDConnectManager) extractThumbprintFromResponse(response *http.Response) error {
 	if response.TLS != nil {
 		if numCerts := len(response.TLS.PeerCertificates); numCerts >= 1 {
 			root := response.TLS.PeerCertificates[numCerts-1]
